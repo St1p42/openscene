@@ -15,14 +15,15 @@ import torch.distributed as dist
 from util import metric
 from torch.utils import model_zoo
 
-from MinkowskiEngine import SparseTensor
 from util import config
 from util.util import export_pointcloud, get_palette, \
     convert_labels_with_palette, extract_text_feature, visualize_labels
 from tqdm import tqdm
-from run.distill import get_model
 
 from dataset.label_constants import *
+
+_DISTILL_GET_MODEL = None
+_SPARSE_TENSOR_CLS = None
 
 
 def get_parser():
@@ -59,6 +60,24 @@ def get_logger():
 def is_url(url):
     scheme = urllib.parse.urlparse(url).scheme
     return scheme in ('http', 'https')
+
+
+def get_model(cfg):
+    # Import lazily so fusion mode can run without MinkowskiEngine installed.
+    global _DISTILL_GET_MODEL
+    if _DISTILL_GET_MODEL is None:
+        from run.distill import get_model as distill_get_model
+        _DISTILL_GET_MODEL = distill_get_model
+    return _DISTILL_GET_MODEL(cfg)
+
+
+def get_sparse_tensor(feat, coords):
+    # Import lazily so fusion mode can run without MinkowskiEngine installed.
+    global _SPARSE_TENSOR_CLS
+    if _SPARSE_TENSOR_CLS is None:
+        from MinkowskiEngine import SparseTensor
+        _SPARSE_TENSOR_CLS = SparseTensor
+    return _SPARSE_TENSOR_CLS(feat, coords)
 
 def main_process():
     return not args.multiprocessing_distributed or (
@@ -147,7 +166,6 @@ def main_worker(gpu, ngpus_per_node, argss):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size,
                                 rank=args.rank)
 
-    model = get_model(args)
     if main_process():
         global logger
         logger = get_logger()
@@ -157,9 +175,14 @@ def main_worker(gpu, ngpus_per_node, argss):
         torch.cuda.set_device(gpu)
         args.test_batch_size = int(args.test_batch_size / ngpus_per_node)
         args.test_workers = int(args.test_workers / ngpus_per_node)
-        model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[gpu])
-    else:
-        model = model.cuda()
+
+    model = None
+    if args.feature_type != 'fusion':
+        model = get_model(args)
+        if args.distributed:
+            model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[gpu])
+        else:
+            model = model.cuda()
 
     if args.feature_type == 'fusion':
         pass # do not need to load weight
@@ -258,7 +281,8 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
         precompute_text_related_properties(labelset_name)
 
     with torch.no_grad():
-        model.eval()
+        if model is not None:
+            model.eval()
         store = 0.0
         for rep_i in range(args.test_repeats):
             preds, gts = [], []
@@ -281,11 +305,11 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                 masks = []
 
             for i, (coords, feat, label, feat_3d, mask, inds_reverse) in enumerate(tqdm(val_data_loader)):
-                sinput = SparseTensor(feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
-                coords = coords[inds_reverse, :]
-                pcl = coords[:, 1:].cpu().numpy()
+                coords_reverse = coords[inds_reverse, :]
+                pcl = coords_reverse[:, 1:].cpu().numpy()
 
                 if feature_type == 'distill':
+                    sinput = get_sparse_tensor(feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
                     predictions = model(sinput)
                     predictions = predictions[inds_reverse, :]
                     pred = predictions.half() @ text_features.t()
@@ -300,6 +324,7 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                         logits_pred[~mask[inds_reverse]] = len(labelset)-1
 
                 elif feature_type == 'ensemble':
+                    sinput = get_sparse_tensor(feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
                     feat_fuse = feat_3d.cuda(non_blocking=True)[inds_reverse, :]
                     # pred_fusion = feat_fuse.half() @ text_features.t()
                     pred_fusion = (feat_fuse/(feat_fuse.norm(dim=-1, keepdim=True)+1e-5)).half() @ text_features.t()
